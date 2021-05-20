@@ -288,7 +288,7 @@ class FunctionInfo:
     def generate_pyx(self, writer, classname):
         if self.is_static:
             writer.write(INDENT + "@staticmethod\n")
-        params = []
+        params = ["self"]
         param_names = []
         for param in self.parameters:
             params.append("{}: {}".format(param.name, python_type_name(param.type)))
@@ -343,7 +343,7 @@ class ClassInfo:
         """Generate the pxd(header) for the parsed class."""
 
         writer.write(INDENT)
-        writer.write('cppclass {} "{}":\n'.format(self.cython_class_name,
+        writer.write('cdef cppclass {} "{}":\n'.format(self.cython_class_name,
                                                   self.full_cpp_class_name))
         for func in self.functions:
             func.generate_pxd(writer, self.cython_class_name)
@@ -372,7 +372,7 @@ class Generator(object):
             return sys.stdout
         else:
             filename = self.output_base + suffix
-            return open(filename, "w+")
+            return open(filename, "a")
 
     def maybe_close(self, writer):
         if writer != sys.stdout:
