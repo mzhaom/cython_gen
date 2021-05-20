@@ -365,7 +365,10 @@ class Function(_GenericDeclaration):
     self.modifiers = modifiers
     self.body = body
     self.templated_types = templated_types
+    self.visibility = None
 
+  def IsPublic(self):
+    return self.visibility == VISIBILITY_PUBLIC
   def IsDeclaration(self):
     return self.body is None
 
@@ -1149,9 +1152,11 @@ class AstBuilder(object):
       return Method(indices.start, indices.end, name.name, in_class,
                     return_type, parameters, modifiers, templated_types,
                     body, self.namespace_stack)
-    return Function(indices.start, indices.end, name.name, return_type,
-                    parameters, modifiers, templated_types, body,
-                    self.namespace_stack)
+    ret = Function(indices.start, indices.end, name.name, return_type,
+                   parameters, modifiers, templated_types, body,
+                   self.namespace_stack)
+    ret.visibility = self.visibility
+    return ret
 
   def _GetReturnTypeAndClassName(self, token_seq):
     # Splitting the return type from the class name in a method

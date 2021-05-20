@@ -14,32 +14,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Generate Google Mock classes from base classes.
+"""Generate cython related files for classes within a given cpp header files.
 
-This program will read in a C++ source file and output the Google Mock
-classes for the specified classes.  If no class is specified, all
-classes in the source file are emitted.
-
-Usage:
-  cython_class.py header-file.h [ClassName]...
-
-Output is sent to stdout.
+This program will read in a C++ source file and output the cython
+boiler plates for the specified classes.  If no class is specified,
+all classes in the source file are emitted.
 """
 
+import argparse
 import os
 import re
 import sys
 
 from cpp import ast
 from cpp import utils
-
-# Preserve compatibility with Python 2.3.
-try:
-  _dummy = set
-except NameError:
-  import sets
-
-  set = sets.Set
 
 _VERSION = (1, 0, 0)  # The version of this script.
 # How many spaces to indent.  Can set me with the INDENT environment variable.
@@ -225,8 +213,21 @@ def python_type_name(type_info):
     else:
         return type_info.name
 
+def cython_type_name(type_info):
+    """Given a type instance parsed from ast, return the right python type"""
+    # print(type_info)
+    if type_info is None:
+        return "void"
+    ret = type_info.name
+    if type_info.templated_types:
+        return "{}<{}>".format(ret, cython_type_name(type_info.templated_types[0]))
+    return ret
+
+
+INDENT = " " * 4
+
 class FunctionInfo:
-    INDENT = " " * 4
+
     @staticmethod
     def create(node):
         ret = FunctionInfo(node.name)
@@ -265,22 +266,69 @@ class FunctionInfo:
 
     def generate_pyi(self, writer):
         if self.is_static:
-            writer.write(self.INDENT + "@staticmethod\n")
+            writer.write(INDENT + "@staticmethod\n")
         params = []
         for param in self.parameters:
             params.append("{}: {}".format(param.name, python_type_name(param.type)))
-        writer.write(self.INDENT + "def {}({}) -> {}: ...\n".format(
+        writer.write(INDENT + "def {}({}) -> {}: ...\n".format(
             self.python_name, ", ".join(params), self.return_type_name))
+        writer.write("\n")
+
+    def generate_pxd(self, writer, classname):
+        if self.is_static:
+            writer.write(INDENT)
+            writer.write(INDENT + "@staticmethod\n")
+        writer.write(INDENT)
+        writer.write(INDENT)
+        return_type_name = "" if self.is_ctor else cython_type_name(self.return_type) + " "
+        writer.write("{}{}()\n".format(return_type_name,
+                                       classname if self.is_ctor else self.name))
+        writer.write("\n")
+
+    def generate_pyx(self, writer, classname):
+        if self.is_static:
+            writer.write(INDENT + "@staticmethod\n")
+        params = []
+        param_names = []
+        for param in self.parameters:
+            params.append("{}: {}".format(param.name, python_type_name(param.type)))
+            param_names.append(param.name)
+        writer.write(INDENT + "def {}({}) -> {}:\n".format(
+            self.python_name, ", ".join(params), self.return_type_name))
+        # Function body by calling to the underlying _cpp_obj
+        writer.write(INDENT)
+        writer.write(INDENT)
+        if self.is_ctor:
+            writer.write("self._cpp_obj = make_unique[{}]({})\n".format(
+                classname, ", ".join(param_names)))
+        elif self.is_static:
+            writer.write("return {}.{}({})\n".format(
+                classname,
+                self.python_name, ", ".join(param_names)))
+        else:
+            writer.write("return deref(self._cpp_obj).{}({})\n".format(
+                self.python_name, ", ".join(param_names)))
+        writer.write("\n")
+
 
 class ClassInfo:
-    def __init__(self, name, namespace):
+    def __init__(self, name, namespace, filename):
         self.name = name
         self.namespace = namespace  # Could be none
+        self.filename = filename
         self.functions = []
 
     @property
     def python_class_name(self):
         return self.name
+
+    @property
+    def full_cpp_class_name(self):
+        tokens = []
+        if self.namespace:
+            tokens += self.namespace
+        tokens.append(self.name)
+        return "::".join(tokens)
 
     @property
     def cython_class_name(self):
@@ -291,16 +339,69 @@ class ClassInfo:
         for func in self.functions:
             func.generate_pyi(writer)
 
+    def generate_pxd(self, writer):
+        """Generate the pxd(header) for the parsed class."""
+
+        writer.write(INDENT)
+        writer.write('cppclass {} "{}":\n'.format(self.cython_class_name,
+                                                  self.full_cpp_class_name))
+        for func in self.functions:
+            func.generate_pxd(writer, self.cython_class_name)
+
+    def generate_pyx(self, writer):
+        writer.write("cdef class {}:\n".format(self.python_class_name))
+        # The cython instance
+        writer.write(INDENT)
+        writer.write("cdef unique_ptr[{}] _cpp_obj\n".format(
+            self.cython_class_name))
+        for func in self.functions:
+            func.generate_pyx(writer, self.cython_class_name)
+
     def __repr__(self):
         return str(self.__dict__)
 
 
-def prepare_class_info(ast_list):
+class Generator(object):
+    def __init__(self, all_classes, filename, output_base):
+        self.all_classes = all_classes
+        self.filename = filename
+        self.output_base = output_base
+
+    def get_writer(self, suffix):
+        if self.output_base == "stdout":
+            return sys.stdout
+        else:
+            filename = self.output_base + suffix
+            return open(filename, "w+")
+
+    def maybe_close(self, writer):
+        if writer != sys.stdout:
+            writer.close()
+
+    def generate(self):
+        fp = self.get_writer(".pyi")
+        for c in self.all_classes:
+            c.generate_pyi(fp)
+        self.maybe_close(fp)
+
+        fp = self.get_writer(".pxd")
+        fp.write("cdef extern from \"{}\":\n".format(self.filename))
+        for c in self.all_classes:
+            c.generate_pxd(fp)
+        self.maybe_close(fp)
+
+        fp = self.get_writer(".pyx")
+        fp.write("from libcpp.memory cimport make_unique, unique_ptr\n")
+        for c in self.all_classes:
+            c.generate_pyx(fp)
+        self.maybe_close(fp)
+
+
+def prepare_class_info(filename, ast_list):
   ret = []
   for node in ast_list:
     if isinstance(node, ast.Class) and node.body:
-      print(node.name)
-      class_info = ClassInfo(node.name, node.namespace)
+      class_info = ClassInfo(node.name, node.namespace, filename)
       ret.append(class_info)
       # Ignore node.templated_types
 
@@ -309,42 +410,42 @@ def prepare_class_info(ast_list):
         if isinstance(func, ast.Function):
           if not func.IsPublic():
             continue
-          print(func)
           # Interesting fields: modifiers, return_type, parameters.
           class_info.functions.append(FunctionInfo.create(func))
   # print(ret)
-  for c in ret:
-      c.generate_pyi(sys.stdout)
   return ret
 
 
 def main(argv=sys.argv):
-  if len(argv) < 2:
-    sys.stderr.write('Cython Generator for C++ class v%s\n\n' %
-                     '.'.join(map(str, _VERSION)))
-    sys.stderr.write(__doc__)
-    return 1
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter, description=__doc__
+    )
+    parser.add_argument(
+        "filename",
+        type=str,
+        default=None,
+        help="name of the file to parse",
+    )
+    parser.add_argument(
+        "--output_base",
+        type=str,
+        default="stdout",
+        help="The output file name prefix, if it's set to foo, "
+        "foo.pyi, foo.pyx, foo.pxd will be written",
+    )
+    args = parser.parse_args()
+    filename = args.filename
 
-  global _INDENT
-  try:
-    _INDENT = int(os.environ['INDENT'])
-  except KeyError:
-    pass
-  except:
-    sys.stderr.write('Unable to use indent of %s\n' % os.environ.get('INDENT'))
+    source = utils.ReadFile(filename)
+    if source is None:
+        return 1
 
-  filename = argv[1]
-  desired_class_names = None  # None means all classes in the source file.
-  if len(argv) >= 3:
-    desired_class_names = set(argv[2:])
-  source = utils.ReadFile(filename)
-  if source is None:
-    return 1
-
-  builder = ast.BuilderFromSource(source, filename)
-  entire_ast = filter(None, builder.Generate())
-  prepare_class_info(entire_ast)
-
+    builder = ast.BuilderFromSource(source, filename)
+    entire_ast = filter(None, builder.Generate())
+    generator = Generator(
+        prepare_class_info(filename, entire_ast),
+        filename, args.output_base)
+    generator.generate()
 
 
 if __name__ == '__main__':
